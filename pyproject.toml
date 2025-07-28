@@ -1,0 +1,15 @@
+[project]
+name = "text-to-sql-generator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic>=0.49.0",
+    "click>=8.1.8",
+    "crayons>=0.4.0",
+    "dotenv>=0.9.9",
+    "openai>=1.68.2",
+    "psycopg>=3.2.6",
+    "pydantic>=2.10.6",
+]
