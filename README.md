@@ -1,6 +1,7 @@
 # Question Generator for Text-to-SQL Datasets
 
-This tool can be used to generate questions on datasets for text-to-sql.
+This tool can be used to generate questions for datasets for
+[`text-to-sql-eval`](https://github.com/timescale/text-to-sql-eval).
 
 ## Requirements
 
