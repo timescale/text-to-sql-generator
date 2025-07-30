@@ -87,6 +87,23 @@ This function does the following to generate questions:
 8. If the query was deemed adequate, save the `[question, query]` tuple to the
   `questions` table in `./data.sqlite`.
 
+### Export questions
+
+```text
+$ uv run python3 -m generator export --help
+Usage: python -m generator export [OPTIONS]
+
+  Export generated questions
+
+Options:
+  --help  Show this message and exit.
+```
+
+This takes all the questions that have been previously generated and exports
+them to `evals` folder at the root of this repo. This folder can then be copied
+into [`text-to-sql-eval`](https://github.com/timescale/text-to-sql-eval) repo
+for usage as eval dataset.
+
 ## Quickstart
 
 To demonstrate the repo, we provide quickstart guide. For this, we will use the
