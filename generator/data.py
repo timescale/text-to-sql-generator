@@ -1,4 +1,5 @@
 import atexit
+from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 
@@ -15,41 +16,37 @@ if not initialized:
     cur.execute("""
         CREATE TABLE questions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            complexity TEXT NOT NULL CHECK (complexity IN ('easy', 'intermediate', 'hard')),
-            question TEXT NOT NULL
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE answers (
-            id INTEGER NOT NULL PRIMARY KEY,
+            question TEXT NOT NULL,
             answer TEXT NOT NULL,
-            results TEXT, -- Using text type for json data
-            error TEXT,  -- Using text type for jsonb data
-            FOREIGN KEY (id) REFERENCES questions (id) ON DELETE CASCADE
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE adequate (
-            id INTEGER NOT NULL PRIMARY KEY,
-            adequate INTEGER NOT NULL, -- SQLite uses integer 0 (false) and 1 (true) for boolean
-            reason TEXT,
-            FOREIGN KEY (id) REFERENCES questions (id) ON DELETE CASCADE
+            complexity TEXT NOT NULL CHECK (complexity IN ('easy', 'intermediate', 'hard'))
         );
     """)
     con.commit()
     initialized = True
 
 
-def load_questions() -> list[tuple[str, str]]:
+@dataclass
+class Question:
+    id: int
+    question: str
+    answer: str
+    complexity: str
+
+
+def load_questions() -> list[Question]:
     cur = con.cursor()
-    cur.execute("SELECT question, complexity FROM questions")
-    return [(row[0], row[1]) for row in cur.fetchall()]
+    cur.execute("""
+        SELECT * FROM questions ORDER BY id
+    """)
+    ret = [Question(*row) for row in cur.fetchall()]
+    cur.close()
+    return ret
 
-
-def save_question(question: str, complexity: str) -> None:
+def save_question(question: str, answer: str, complexity: str) -> None:
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO questions (question, complexity) VALUES (%s, %s)",
-        (question, complexity),
+        "INSERT INTO questions (question, answer, complexity) VALUES (?, ?, ?)",
+        (question, answer, complexity),
     )
     con.commit()
+    cur.close()

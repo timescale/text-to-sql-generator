@@ -2,6 +2,7 @@ import atexit
 from dotenv import load_dotenv
 import json
 import os
+from pgai.semantic_catalog.gen_sql import fetch_database_context_alt
 import psycopg
 from psycopg.errors import Diagnostic
 from typing import Any
@@ -11,12 +12,6 @@ load_dotenv()
 
 con = psycopg.connect(os.environ.get("DB_URL"))
 atexit.register(con.close)
-with con.cursor() as cur:
-    for key in ["anthropic_api_key", "openai_api_key"]:
-        cur.execute(
-            "select set_config(%s, %s, false)",
-            ("ai." + key.lower(), os.environ[key.upper()]),
-        )
 
 
 def diag_to_dict(diagnostic: Diagnostic) -> dict[str, Any]:
@@ -55,39 +50,14 @@ def execute_query(query: str) -> tuple[str, bool]:
             return json.dumps(diag_to_dict(err.diag)), False
 
 
-def get_schema_description() -> str:
-    with con.cursor() as cur:
-        cur.execute("""
-            select string_agg
-            ( ai._render_semantic_catalog_table
-                ( o.id
-                , o.classid
-                , o.objid
-                )
-            , E'\n'
-            order by o.id
-            )
-            from ai.semantic_catalog_obj o
-            where o.objtype = 'table'
-        """)
-        tables = cur.fetchone()[0]
-        cur.execute("""
-            select string_agg
-            ( ai._render_semantic_catalog_view
-                ( o.id
-                , o.classid
-                , o.objid
-                )
-            , E'\n'
-            order by o.id
-            )
-            from ai.semantic_catalog_obj o
-            where o.objtype = 'view'
-        """)
-        views = cur.fetchone()[0]
-    return f"{tables}\n{views}"
-
-
+async def get_schema_description() -> str:
+    async with await psycopg.AsyncConnection.connect(os.environ.get("DB_URL")) as conn:
+        ctx = await fetch_database_context_alt(conn, conn, 1, None, None, None)
+        return "\n".join(
+            list(ctx.rendered_objects.values())
+            + list(ctx.rendered_facts.values())
+            + list(ctx.rendered_sql_examples.values())
+        )
 
 
 def get_results(
@@ -104,13 +74,3 @@ def get_results(
             return cur.fetchone()[0], None
         except psycopg.Error as err:
             return None, diag_to_dict(err.diag)
-
-
-def generate_sql(
-    question: str,
-) -> tuple[str, None | list[dict[str, Any]], None | dict[str, Any]]:
-    with con.cursor() as cur:
-        cur.execute("select ai.text_to_sql(%s)", (question,))
-        query: str = cur.fetchone()[0]
-    results, error = get_results(query)
-    return query, results, error

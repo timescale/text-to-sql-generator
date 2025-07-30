@@ -9,13 +9,13 @@ from anthropic.types import (
     ToolResultBlockParam,
     ThinkingBlockParam,
 )
-from crayons import blue
 import json
 from textwrap import dedent
 from typing import Any, Optional
 
-from .data import load_questions, save_question
-from .database import execute_query, generate_sql, get_schema_description
+from .data import Question, load_questions, save_question
+from .database import execute_query, get_schema_description
+from .exceptions import FailedGeneration
 from .log import print_msg
 from .utils import split_number
 
@@ -31,21 +31,22 @@ Interesting variations on these are allowed, but do not repeat them verbatim
 
 
 def questions_system_prompt(
-    prompt: str, schema_description: str, past_questions: list[tuple[str, str]], session_questions: list[tuple[str, str]]
+    prompt: str,
+    schema_description: str,
+    past_questions: list[Question],
+    session_questions: list[Question],
 ) -> str:
     system_prompt = prompt.replace("{schema_description}", schema_description)
+    questions = past_questions + session_questions
+    if len(questions) > 0:
+        formatted_questions = ""
+        for i, t in enumerate(questions):
+            formatted_questions += f"{i}. [{t.complexity}] {t.question}\n"
 
-    for questions in [past_questions, session_questions]:
-        session = "a previous session" if questions == past_questions else "the current session"
-        if len(questions) > 0:
-            formatted_questions = ""
-            for i, t in enumerate(questions):
-                formatted_questions += f"{i}. [{t[1]}] {t[0]}\n"
-
-            system_prompt += dedent(f"""
-            Below are questions that have invented in {session}:
-            {formatted_questions}
-            """).rstrip()
+        system_prompt += dedent(f"""
+        Below are questions that have been previously invented about the dataset:
+        {formatted_questions}
+        """).rstrip()
     return system_prompt
 
 
@@ -197,9 +198,15 @@ def fix_sql(
                         "fixable_reason": {
                             "type": "string",
                             "description": "An explanation of why the inadequacy is fixable or not.",
-                        }
+                        },
                     },
-                    "required": ["modify_sql", "fixed_sql", "reason", "fixable", "fixable_reason"],
+                    "required": [
+                        "modify_sql",
+                        "fixed_sql",
+                        "reason",
+                        "fixable",
+                        "fixable_reason",
+                    ],
                 },
             },
         ],
@@ -222,18 +229,86 @@ def fix_sql(
     return modify_sql, sql, reason, fixable, fixable_reason
 
 
-def generate_questions(count: int, prompt: str) -> None:
+def generate_sql(
+    client: Anthropic, schema_description: str, question: str
+) -> tuple[str, None | list[dict[str, Any]], None | dict[str, Any]]:
+    resp = send_message(
+        client,
+        dedent(f"""
+            You are an expert at generating prompts for LLMs. You understand and know SQL for
+            PostgreSQL 17 and Timescale.
+
+            Below is a description of schema of the database. Sample rows are included for
+            each table. Analyze and understand the schema.
+
+            {schema_description}
+        """).strip(),
+        messages=[
+            MessageParam(
+                role="user",
+                content=dedent(f"""
+                    Given the schema, generate a SQL query that can be used to answer the following question:
+                    <question>
+                    {question}
+                    </question>
+                    You should write the SQL query in a way that is easy to understand and follows best practices
+                    for SQL queries in PostgreSQL 17 and Timescale.
+
+                    You should NOT include any comments in the SQL query.
+                """).strip(),
+            )
+        ],
+        tools=[
+            {
+                "name": "record_sql",
+                "description": "Record generated SQL query for the question",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "sql": {
+                            "type": "string",
+                            "description": "The generated SQL query.",
+                        }
+                    },
+                    "required": ["sql"],
+                },
+            }
+        ],
+    )
+    for content_block in resp.content:
+        if isinstance(content_block, ToolUseBlock):
+            if content_block.name == "record_sql":
+                try:
+                    sql = content_block.input["sql"].strip()
+                except KeyError:
+                    print("Response content:", content_block.input)
+                    raise Exception("Tool call 'record_sql' did not return 'sql'.")
+                print_msg(f"Generated SQL:\n{sql}")
+                result, success = execute_query(sql)
+                if not success:
+                    print_msg(f"Error running SQL:\n{result}")
+                    return sql, None, result
+                print_msg(f"SQL results:\n{result}")
+                return sql, result, None
+            else:
+                raise Exception("Unrecognized tool: " + content_block.name)
+    raise FailedGeneration("No SQL found in response")
+
+
+async def generate_questions(count: int, prompt: str) -> None:
     past_questions = load_questions()
     session_questions = []
     client = Anthropic()
-    schema_description = get_schema_description()
+    schema_description = await get_schema_description()
     counts = split_number(count)
     generated_complexities = {
         "easy": counts[0],
         "intermediate": counts[1],
         "hard": counts[2],
     }
-    print_msg(f"Generating {count} questions [{generated_complexities['easy']} easy, {generated_complexities['intermediate']} intermediate, {generated_complexities['hard']} hard]...")
+    print_msg(
+        f"Generating {count} questions [{generated_complexities['easy']} easy, {generated_complexities['intermediate']} intermediate, {generated_complexities['hard']} hard]..."
+    )
     while True:
         if len(session_questions) >= count:
             break
@@ -249,7 +324,11 @@ def generate_questions(count: int, prompt: str) -> None:
         ]
         print_msg("sending message...")
         response = send_generate_message(
-            client, questions_system_prompt(prompt, schema_description, past_questions, session_questions), messages
+            client,
+            questions_system_prompt(
+                prompt, schema_description, past_questions, session_questions
+            ),
+            messages,
         )
         for content_block in response.content:
             if isinstance(content_block, TextBlock):
@@ -306,7 +385,26 @@ def generate_questions(count: int, prompt: str) -> None:
                     question = inputs["question"]
                     complexity = inputs["complexity"]
                     print_msg(f"generated question:\n[{complexity}] {question}")
-                    sql, sql_results, sql_error = generate_sql(question)
+                    try:
+                        sql, sql_results, sql_error = generate_sql(
+                            client, schema_description, question
+                        )
+                    except FailedGeneration as e:
+                        print_msg(f"Failed to generate SQL for question: {e}")
+                        messages.append(
+                            MessageParam(
+                                role="user",
+                                content=[
+                                    ToolResultBlockParam(
+                                        tool_use_id=id,
+                                        content=f"Failed to generate SQL for the question: {e}. Please generate a new question.",
+                                        is_error=True,
+                                        type="tool_result",
+                                    )
+                                ],
+                            )
+                        )
+                        continue
                     print_msg(f"generated sql:\n{sql}")
                     if sql_error is not None:
                         print_msg(f"error running sql:\n{sql_error}")
@@ -314,14 +412,16 @@ def generate_questions(count: int, prompt: str) -> None:
                         print_msg(f"sql results:\n{sql_results}")
 
                     while True:
-                        modified_sql, new_sql, reason, fixable, fixable_reason = fix_sql(
-                            client,
-                            prompt,
-                            schema_description,
-                            question,
-                            sql,
-                            sql_results,
-                            sql_error,
+                        modified_sql, new_sql, reason, fixable, fixable_reason = (
+                            fix_sql(
+                                client,
+                                prompt,
+                                schema_description,
+                                question,
+                                sql,
+                                sql_results,
+                                sql_error,
+                            )
                         )
                         if not modified_sql:
                             break
@@ -340,6 +440,8 @@ def generate_questions(count: int, prompt: str) -> None:
                                     ],
                                 )
                             )
+                            new_sql = None
+                            sql = None
                             break
                         print_msg(f"modified sql:\n{new_sql}\n{reason}")
                         sql = new_sql
@@ -352,32 +454,39 @@ def generate_questions(count: int, prompt: str) -> None:
                             print_msg(f"sql results:\n{sql_results}")
                             sql_results = result
                             sql_error = None
-                    print_msg(f"question was adequate:\n{reason}")
-                    print_msg("saving question")
-                    # save_question(question, complexity)
-                    session_questions.append((question, complexity))
-                    generated_complexities[complexity] -= 1
-                    messages.append(
-                        MessageParam(
-                            role="user",
-                            content=[
-                                ToolResultBlockParam(
-                                    tool_use_id=id,
-                                    content="question saved!",
-                                    is_error=False,
-                                    type="tool_result",
-                                )
-                            ],
+                    if sql is not None:
+                        print_msg(f"question was adequate:\n{reason}")
+                        print_msg("saving question")
+                        save_question(question, sql, complexity)
+                        session_questions.append(Question(
+                            id=0,
+                            question=question,
+                            answer=sql,
+                            complexity=complexity,
+                        ))
+                        generated_complexities[complexity] -= 1
+                        messages.append(
+                            MessageParam(
+                                role="user",
+                                content=[
+                                    ToolResultBlockParam(
+                                        tool_use_id=id,
+                                        content="question saved!",
+                                        is_error=False,
+                                        type="tool_result",
+                                    )
+                                ],
+                            )
                         )
-                    )
-
+                    else:
+                        print_msg("failed to generate question, trying again...")
                 else:
                     raise Exception(f"Unrecognized tool: {name}")
 
 
-def generate_prompt_base() -> str:
+async def generate_prompt_base() -> str:
     client = Anthropic()
-    schema_description = get_schema_description()
+    schema_description = await get_schema_description()
     print_msg("Generating prompt base...")
     resp = send_message(
         client,
@@ -434,10 +543,13 @@ def generate_prompt_base() -> str:
                     "required": ["prompt"],
                 },
             }
-        ]
+        ],
     )
     for content_block in resp.content:
-        if isinstance(content_block, ToolUseBlock) and content_block.name == "record_prompt":
+        if (
+            isinstance(content_block, ToolUseBlock)
+            and content_block.name == "record_prompt"
+        ):
             prompt = content_block.input["prompt"].strip()
             print(prompt)
             return prompt

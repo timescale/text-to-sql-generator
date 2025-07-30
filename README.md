@@ -8,33 +8,22 @@ To use this table, you will need:
 
 * Python
 * [uv](https://github.com/astral-sh/uv)
-* A PostgreSQL database with [pgai](https://github.com/timescale/pgai) installed
+* A PostgreSQL database with [pgai semantic-catalog](https://github.com/timescale/pgai/blob/main/docs/semantic_catalog/quickstart.md) setup
+
+It's expected that for your dataset, you have setup the semantic-catalog such that
+all objects have had descriptions created/generated.
 
 ## Setup
 
+After cloning the repo, to install dependencies:
+
 ```bash
 uv sync
+cp .env.sample .env
 ```
 
-After loading the dataset into the database, you will need to initialize the
-semantic catalog (TODO: link to docs) for your database. You can use the
-following function to generate the descriptions for your database, assuming
-everything is in the `public` schema:
-
-```sql
-select
-  format('select x.sql from ai.generate_description(%L) x;', x.oid::regclass)
-, format('select x.sql from ai.generate_column_descriptions(%L) x;', x.oid::regclass)
-from
-(
-    select k.*
-    from pg_class k
-    inner join pg_namespace n on (k.relnamespace = n.oid)
-    where n.nspname = 'public'
-    and k.relkind in ('r', 'p', 'v', 'm')
-    order by k.relname
-);
-```
+You will then need to modify `DB_URL` to point at the dataset you want to generate questions for, and add
+value for `OPENAI_API_KEY`.
 
 ## Usage
 
@@ -97,3 +86,165 @@ This function does the following to generate questions:
   modified SQL to get new results or error, and then go back to (5).
 8. If the query was deemed adequate, save the `[question, query]` tuple to the
   `questions` table in `./data.sqlite`.
+
+## Quickstart
+
+To demonstrate the repo, we provide quickstart guide. For this, we will use the
+[Analyze the Bitcoin Blockchain](https://docs.tigerdata.com/tutorials/latest/blockchain-analyze/)
+guide from Tiger Cloud docs.
+
+First, start up a TimescaleDB docker instance:
+
+```bash
+docker run -d --name postgres-bitcoin \
+    -p 127.0.0.1:5432:5432 \
+    -e POSTGRES_HOST_AUTH_METHOD=trust \
+    -e POSTGRES_DB=bitcoin \
+    timescale/timescaledb-ha:pg17
+```
+
+Next is to setup the DB:
+
+```bash
+psql -h localhost -U postgres -d bitcoin -c "
+CREATE TABLE transactions (
+   time TIMESTAMPTZ NOT NULL,
+   block_id INT,
+   hash TEXT,
+   size INT,
+   weight INT,
+   is_coinbase BOOLEAN,
+   output_total BIGINT,
+   output_total_usd DOUBLE PRECISION,
+   fee BIGINT,
+   fee_usd DOUBLE PRECISION,
+   details JSONB
+) WITH (
+   tsdb.hypertable,
+   tsdb.partition_column='time',
+   tsdb.segmentby='block_id',
+   tsdb.orderby='time DESC'
+);
+
+CREATE INDEX hash_idx ON public.transactions USING HASH (hash);
+CREATE INDEX block_idx ON public.transactions (block_id);
+CREATE UNIQUE INDEX time_hash_idx ON public.transactions (time, hash);
+"
+```
+
+Next, download the `bitcoin_sample.zip`, unzip it, and then copy it into the DB.
+As there's over a million rows, it may take a few minutes to load the data.
+
+```bash
+wget https://assets.timescale.com/docs/downloads/bitcoin-blockchain/bitcoin_sample.zip
+unzip bitcoin_sample.zip
+psql -h localhost -U postgres -d bitcoin -c "\COPY transactions FROM 'tutorial_bitcoin_sample.csv' CSV HEADER;"
+```
+
+Then create the continuous aggregates:
+
+```bash
+psql -h localhost -U postgres -d bitcoin -c "
+CREATE MATERIALIZED VIEW one_hour_transactions
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket,
+   count(*) AS tx_count,
+   sum(fee) AS total_fee_sat,
+   sum(fee_usd) AS total_fee_usd,
+   stats_agg(fee) AS stats_fee_sat,
+   avg(size) AS avg_tx_size,
+   avg(weight) AS avg_tx_weight,
+   count(
+         CASE
+            WHEN (fee > output_total) THEN hash
+            ELSE NULL
+         END) AS high_fee_count
+  FROM transactions
+  WHERE (is_coinbase IS NOT TRUE)
+GROUP BY bucket;
+"
+
+psql -h localhost -U postgres -d bitcoin -c "
+CREATE MATERIALIZED VIEW one_hour_blocks
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket,
+   block_id,
+   count(*) AS tx_count,
+   sum(fee) AS block_fee_sat,
+   sum(fee_usd) AS block_fee_usd,
+   stats_agg(fee) AS stats_tx_fee_sat,
+   avg(size) AS avg_tx_size,
+   avg(weight) AS avg_tx_weight,
+   sum(size) AS block_size,
+   sum(weight) AS block_weight,
+   max(size) AS max_tx_size,
+   max(weight) AS max_tx_weight,
+   min(size) AS min_tx_size,
+   min(weight) AS min_tx_weight
+FROM transactions
+WHERE is_coinbase IS NOT TRUE
+GROUP BY bucket, block_id;
+"
+
+psql -h localhost -U postgres -d bitcoin -c "
+CREATE MATERIALIZED VIEW one_hour_coinbase
+WITH (timescaledb.continuous) AS
+SELECT time_bucket('1 hour', time) AS bucket,
+   count(*) AS tx_count,
+   stats_agg(output_total, output_total_usd) AS stats_miner_revenue,
+   min(output_total) AS min_miner_revenue,
+   max(output_total) AS max_miner_revenue
+FROM transactions
+WHERE is_coinbase IS TRUE
+GROUP BY bucket;
+"
+
+psql -h localhost -U postgres -d bitcoin -c "
+SELECT add_continuous_aggregate_policy('one_hour_transactions',
+   start_offset => INTERVAL '3 hours',
+   end_offset => INTERVAL '1 hour',
+   schedule_interval => INTERVAL '1 hour');
+
+SELECT add_continuous_aggregate_policy('one_hour_blocks',
+   start_offset => INTERVAL '3 hours',
+   end_offset => INTERVAL '1 hour',
+   schedule_interval => INTERVAL '1 hour');
+
+SELECT add_continuous_aggregate_policy('one_hour_coinbase',
+   start_offset => INTERVAL '3 hours',
+   end_offset => INTERVAL '1 hour',
+   schedule_interval => INTERVAL '1 hour');
+"
+```
+
+Now generate descriptions for the schema objects:
+
+```bash
+uv run pgai semantic-catalog describe -d "postgres://postgres@localhost:5432/bitcoin" -f description.yaml
+```
+
+You can view the various descriptions that were generated in the `description.yaml`
+file. Now we can create the semantic-catalog and import the descriptions:
+
+```bash
+uv run pgai semantic-catalog create -c "postgres://postgres@localhost:5432/bitcoin"
+uv run pgai semantic-catalog import -d "postgres://postgres@localhost:5432/bitcoin" -f description.yaml
+```
+
+Modify your `.env` file for this repo to point at the bitcoin database:
+
+```bash
+DB_URL=postgresql://postgres:postgres@localhost:5432/bitcoin
+```
+
+Now generate 10 questions:
+
+```bash
+uv run python3 -m generator generate
+```
+
+Export to `evals` folder at top of repo:
+
+```bash
+uv run python3 -m generator export
+```
