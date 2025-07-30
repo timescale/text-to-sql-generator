@@ -458,12 +458,14 @@ async def generate_questions(count: int, prompt: str) -> None:
                         print_msg(f"question was adequate:\n{reason}")
                         print_msg("saving question")
                         save_question(question, sql, complexity)
-                        session_questions.append(Question(
-                            id=0,
-                            question=question,
-                            answer=sql,
-                            complexity=complexity,
-                        ))
+                        session_questions.append(
+                            Question(
+                                id=0,
+                                question=question,
+                                answer=sql,
+                                complexity=complexity,
+                            )
+                        )
                         generated_complexities[complexity] -= 1
                         messages.append(
                             MessageParam(

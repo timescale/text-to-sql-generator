@@ -42,6 +42,7 @@ def load_questions() -> list[Question]:
     cur.close()
     return ret
 
+
 def save_question(question: str, answer: str, complexity: str) -> None:
     cur = con.cursor()
     cur.execute(
