@@ -75,7 +75,7 @@ This function does the following to generate questions:
 3. Use the `ai.text_to_sql` function to generate a SQL query to answer the
   question.
 4. Run the generated SQL query and get the first 10 sample rows, or any errors
-  that occured during execution.
+  that occurred during execution.
 5. Ask the LLM if the generated SQL adequately answers the question, returning
   the following information:
   a. a reason why the generated query was or was not adequate
